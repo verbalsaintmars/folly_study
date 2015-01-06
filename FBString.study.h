@@ -94,6 +94,8 @@ inline void pod_move(const Pod* b, const Pod* e, Pod* d) {
  */
 enum class AcquireMallocatedString {};
 
+
+//===============================================================================
 // -- Below inside template class fbstring_core
 // template <class Char> class fbstring_core
 
@@ -236,7 +238,11 @@ void writeTerminator() {
  */
 struct RefCounted {
     std::atomic<size_t> refCount_;
-    Char data_[1];
+    Char data_[1]; // this is AWESOME! Used as pivot for accessing MediumLarge data!
+                   // thus also named as data_, same as MediumLarge's data_!!!
+                   // assign array variable is assigning it's address.
+                   // same as &data_
+                   // Also, being used as extra space for \0 !!
 
     static RefCounted * fromData(Char * p) {
       /*
@@ -272,10 +278,11 @@ struct RefCounted {
       }
     }
 
+
     /*
      * Entry point.
      */
-    static RefCounted * create(size_t * size) {
+    static RefCounted * create(size_t * size /*does not contain \0 */) {
       // Don't forget to allocate one extra Char for the terminating
       // null. In this case, however, one Char is already part of the
       // struct.
@@ -283,7 +290,7 @@ struct RefCounted {
        *  sizeof RefCounted + size *  sizeof(Char)
        */
       const size_t allocSize = goodMallocSize(
-        sizeof(RefCounted) + *size * sizeof(Char));
+        sizeof(RefCounted) + *size * sizeof(Char)); // RefCounted size includes \0 !!
       auto result = static_cast<RefCounted*>(checkedMalloc(allocSize));
 
       /*
@@ -291,6 +298,8 @@ struct RefCounted {
        *  it's a operation, not fence.
        *  operation only needs to prevent preceding memory operations from being
        *  reordered past itself.
+       *
+       *  Init. as 1 !
        */
       result->refCount_.store(1, std::memory_order_release);
       /*
@@ -328,8 +337,72 @@ struct RefCounted {
 };
 
 
+//============
+fbstring_core(const fbstring_core & rhs) {
+    assert(&rhs != this);
+    // Simplest case first: small strings are bitblitted
+    // If small string
+    if (rhs.category() == Category::isSmall) {
+        /*
+         * Fist static assert mem layout
+         */
+      static_assert(offsetof(MediumLarge, data_) == 0,
+          "fbstring layout failure");
+      static_assert(offsetof(MediumLarge, size_) == sizeof(ml_.data_),
+          "fbstring layout failure");
+      static_assert(offsetof(MediumLarge, capacity_) == 2 * sizeof(ml_.data_),
+          "fbstring layout failure");
+      /*
+       *
+       */
+      const size_t size = rhs.smallSize();
+      if (size == 0) {
+        ml_.capacity_ = rhs.ml_.capacity_;
+        writeTerminator();
+      } else {
+        // Just write the whole thing, don't look at details. In
+        // particular we need to copy capacity anyway because we want
+        // to set the size (don't forget that the last character,
+        // which stores a short string's length, is shared with the
+        // ml_.capacity field).
+        ml_ = rhs.ml_; // MediumLarge as POD, copy by value, fast!
+      }
+      // size info 存在capacity_裡. 最左邊的byte內
+      assert(category() == Category::isSmall && this->size() == rhs.size());
+
+    } else if (rhs.category() == Category::isLarge) {
+      // Large strings are just refcounted
+      ml_ = rhs.ml_; // 一樣POD copy by value, 然, data_為ptr to heap, ref counted.
+      RefCounted::incrementRefs(ml_.data_);
+      assert(category() == Category::isLarge && size() == rhs.size());
+    } else {
+      // Medium strings are copied eagerly. Don't forget to allocate
+      // one extra Char for the null terminator.
+      auto const allocSize =
+           goodMallocSize((1 + rhs.ml_.size_) * sizeof(Char));
+      ml_.data_ = static_cast<Char*>(checkedMalloc(allocSize));
+        // src
+        // size , perform size - src:
+        // dest
+      fbstring_detail::pod_copy(rhs.ml_.data_,
+                                // 1 for terminator
+                                rhs.ml_.data_ + rhs.ml_.size_ + 1,
+                                ml_.data_);
+      // No need for writeTerminator() here, we copied one extra
+      // element just above.
+      ml_.size_ = rhs.ml_.size_;
+      ml_.capacity_ = (allocSize / sizeof(Char) - 1)
+                      | static_cast<category_type>(Category::isMedium);
+      assert(category() == Category::isMedium);
+    }
+    assert(size() == rhs.size());
+    assert(memcmp(data(), rhs.data(), size() * sizeof(Char)) == 0);
+}
 
 
+
+
+//====================================================================================
 /*
  * SCOPE_EXIT , use lambda trick!
  * ScopeGuard.h
